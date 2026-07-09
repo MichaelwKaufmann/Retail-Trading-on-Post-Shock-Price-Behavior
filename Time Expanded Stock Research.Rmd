@@ -1,0 +1,504 @@
+---
+title: "Time Expanded Stock Research"
+author: "Michael Kaufmann"
+date: "2026-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+##Clear Console
+cat("/f")
+## Remove Objects
+rm(list= ls())
+
+library(fixest)
+library(tidyverse)
+library(dplyr)
+library(RcppRoll)
+library(ggplot2)
+library(scales)
+
+stock_data <- read.csv("C:/Users/Micha/OneDrive - Clemson University/Honors Thesis/Time Expanded Price Data.csv")
+
+oddlot_data <- read.csv("C:/Users/Micha/OneDrive - Clemson University/Honors Thesis/Time Expanded Stock Prices.csv", stringsAsFactors = FALSE)
+
+
+market_data <- read.csv("C:/Users/Micha/OneDrive - Clemson University/Honors Thesis/SP500 Extended Dates.csv")
+
+stock_data <- stock_data %>%
+  select(-PERMNO) %>%
+  mutate(date = as.Date(date)) %>%
+  mutate(PRC = as.numeric(abs(PRC))) %>%
+  group_by(TICKER) %>%
+  mutate(PctChange = as.numeric(RET)) %>%
+  ungroup() %>%
+  select(-RET, -NUMTRD) %>%
+  arrange(TICKER, date) %>%
+  group_by(TICKER) %>%
+  mutate(  ##Create Post Event Return Variables
+    Day1_Price     = lead(PRC, 1),
+    Day5_Price     = lead(PRC, 5),
+    Day1_CumReturn = (Day1_Price / PRC - 1) * 100,
+    Day5_CumReturn = (Day5_Price / PRC - 1) * 100
+  ) 
+  
+  ticker_summary <- stock_data %>%
+  group_by(TICKER) %>%
+  summarise(
+    mean_pct_change = mean(PctChange, na.rm = TRUE),
+    sd_pct_change   = sd(PctChange, na.rm = TRUE),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+stock_data <- stock_data %>%
+  left_join(ticker_summary, by = "TICKER") %>%
+  mutate(
+    z_return = (PctChange - mean_pct_change) / sd_pct_change,
+    Abnormal = abs(z_return) > 2)
+
+
+  
+oddlot_data <- oddlot_data %>%
+  select(-qtr, -security) %>%
+  rename(TICKER = ticker) %>%
+  mutate(date = as.Date(date))
+
+
+market_data <- market_data %>%
+  rename(date = observation_date) %>%
+  mutate(date = as.Date(date)) %>%
+  filter(!is.na(SP500)) %>% 
+  arrange(date) %>%
+  mutate(SP500_Ret = (SP500)/ lag(SP500, 1)-1)
+
+final_data <- stock_data %>%
+  left_join(oddlot_data, by = c("TICKER", "date")) %>%
+  arrange(TICKER, date) %>%
+  mutate(Oddlot_Shares = Oddlot_Volume * 1000,
+  Total_Shares    = VOL, 
+  PRC = abs(PRC)) %>%
+  group_by(TICKER) %>%
+  mutate(
+    retail_intensity = (Oddlot_Rate - mean(Oddlot_Rate, na.rm = TRUE)) /
+                   sd(Oddlot_Rate, na.rm = TRUE)) %>%
+  ungroup() %>%
+  left_join(market_data, by = c("date")) %>%
+  filter(!is.na(PctChange) & !is.na(SP500_Ret)) %>%
+  mutate(Idiosyncratic_Ret = PctChange - SP500_Ret) %>%
+  group_by(TICKER) %>%
+  arrange(date) %>%
+  mutate(car = roll_sum(lead(Idiosyncratic_Ret,1), n = 5, align = "left", fill = NA)) %>%
+  ungroup()
+
+final_data <- final_data %>%
+  group_by(TICKER, date) %>%
+  # Keep the row with the maximum volume for that day
+  slice_max(order_by = VOL, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+final_data <- final_data %>%
+  group_by(TICKER) %>%
+  # Calculate Z-score based on the Abnormal Return (AR)
+  mutate(
+    z_abnormal = (Idiosyncratic_Ret - mean(Idiosyncratic_Ret, na.rm = TRUE)) / sd(Idiosyncratic_Ret, na.rm = TRUE),
+    Abnormal_Flag = abs(z_abnormal) > 2
+  )
+
+
+```
+
+##Plot Data
+```{r}
+ggplot(data = market_data %>% 
+         filter(date < as.Date("2024-01-05")), 
+       aes(x = date, y = SP500)) +
+  geom_line() +
+  labs(
+    title = "Figure 1: S&P 500 Performance",
+    x = "Time",
+    y = "Index Value"
+  ) +
+  theme_minimal()
+
+
+
+ggplot(data = market_data %>% 
+         filter(date < as.Date("2024-01-05")),
+       aes(x = date, y = SP500)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title = "Figure 1: S&P 500 Performance",
+    x = "Date",
+    y = "Index Level",
+    caption = "Source: CRSP / FRED"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+
+
+
+plot_Odd_data <- oddlot_data %>%
+  group_by(date) %>%
+  summarise(mean_oddlot = mean(Oddlot_Rate, na.rm = TRUE))
+
+ggplot(plot_Odd_data, aes(x = date, y = mean_oddlot)) +
+  geom_line() +
+  labs(
+    title = "Figure 2: Oddlot Rate",
+    x = "Time",
+    y = "Mean Oddlot Rate"
+  ) +
+  theme_minimal()
+
+
+# Create the summary table
+ticker_summary <- final_data %>%
+  group_by(TICKER) %>%
+  summarise(
+    Mean_Price         = mean(PRC),
+    Mean_Oddlot_Rate = mean(Oddlot_Rate, na.rm = TRUE),
+    SD_Percent_Change    = sd(PctChange, na.rm = TRUE),
+    Obs_Count        = n() # Useful to see how many days each ticker has
+  )
+
+
+
+
+
+# This creates a clear table of counts and percentages
+bin_counts <- final_data %>%
+  group_by(Shock_Intensity) %>%
+  summarise(
+    Count = n(),
+    Percentage = round((n() / nrow(df)) * 100, 2)
+  ) %>%
+  arrange(desc(Count)) # Sorts by largest group (usually 'Normal')
+
+print(bin_counts)
+
+# This will now show the actual distribution across all 7 bins
+table(final_data$Shock_Intensity)
+
+```
+
+##Simple Regressions
+```{r}
+abnormal_shock_data <- final_data %>% 
+  filter(Abnormal_Flag == TRUE) 
+
+lm(car ~ retail_intensity, data = abnormal_shock_data)
+
+
+feols(car ~ retail_intensity + log(VOL) + PRC + PctChange + sd_pct_change| date, data = abnormal_shock_data)
+
+
+
+```
+
+
+```{r}
+
+final_data <- final_data %>%
+  mutate(Shock_Intensity = case_when(
+    z_abnormal > 2  ~ "Extreme Positive",
+    z_abnormal > 1 ~ "Moderate Positive",
+    z_abnormal > 0 ~ "Positive",
+    z_abnormal < -2 ~ "Extreme Negative",
+    z_abnormal < -1 ~ "Moderate Negative",
+    z_abnormal < 0 ~ "Negative",
+    TRUE            ~ "Normal"
+  )) %>%
+  mutate(Shock_Intensity = factor(Shock_Intensity, 
+                                  levels = c("Normal","Negative", "Moderate Negative", "Extreme Negative", "Positive",  "Moderate Positive" , "Extreme Positive")))
+
+
+
+intensity_feols_vol <- feols(car ~ retail_intensity * Shock_Intensity + VOL + PRC + sd_pct_change  | 
+                         date, 
+                         data = final_data, vcol = "Hetero")
+
+summary(intensity_feols_vol)
+
+model <- feols(car ~ retail_intensity * Shock_Intensity + log(VOL) + log(PRC) + sd_pct_change  | 
+                         date, 
+                         data = final_data, cluster = ~TICKER)
+summary(model)
+
+etable(model, tex = FALSE, interaction.combine = " x ")
+
+# You might need to install it first: install.packages("modelsummary")
+library(modelsummary)
+
+# This will pop up a beautiful, formatted table in your 'Viewer' tab
+modelsummary(model, 
+             stars = TRUE, 
+             statistic = 'std.error', 
+             gof_omit = 'AIC|BIC|Log.Lik')
+
+
+
+```
+
+
+##Encompassing Regressions
+```{r}
+final_data <- final_data %>%
+  mutate(Shock_Intensity = case_when(
+    z_abnormal > 3  ~ "Extreme Positive",
+    z_abnormal > 2  ~ "High Positive",
+    z_abnormal > 1 ~ "Moderate Positive",
+    z_abnormal < -3 ~ "Extreme Negative",
+    z_abnormal < -2 ~ "High Negative",
+    z_abnormal < -1 ~ "Moderate Negative",
+    TRUE            ~ "Normal"
+  )) %>%
+  mutate(Shock_Intensity = factor(Shock_Intensity, 
+                                  levels = c("Normal", "Moderate Negative", "High Negative", "Extreme Negative", "Moderate Positive" , "High Positive", "Extreme Positive")))
+
+
+
+# Model: Impact of Discrete Shock Intensity on 5-Day CAR
+intensity_feols <- feols(car ~ retail_intensity : Shock_Intensity + log(VOL) + PRC + PctChange + VolatilityRank | 
+                         date, 
+                         data = final_data)
+
+summary(intensity_feols)
+
+intensity_feols_vol <- feols(car ~ retail_intensity * Shock_Intensity + log(VOL) + PRC + PctChange + sd_pct_change | 
+                         date, 
+                         data = final_data, vcol = "Hetero")
+
+summary(intensity_feols_vol)
+
+# 1. Identify the coefficients that contain the interaction
+# This creates a vector of the names you want to plot
+interaction_vars <- grep("retail_intensity:Shock_Intensity", names(coef(intensity_feols)), value = TRUE)
+
+# 2. Reorder them manually (so they don't appear in alphabetical order)
+# Match these strings exactly to how they look in your summary() output
+target_order <- c(
+  "retail_intensity:Shock_IntensityExtreme Negative",
+  "retail_intensity:Shock_IntensityHigh Negative",
+  "retail_intensity:Shock_IntensityModerate Negative",
+  "retail_intensity:Shock_IntensityNormal",
+  "retail_intensity:Shock_IntensityModerate Positive",
+  "retail_intensity:Shock_IntensityHigh Positive",
+  "retail_intensity:Shock_IntensityExtreme Positive"
+)
+
+# 3. Plot using coefplot
+coefplot(intensity_feols, 
+         keep = target_order,
+         main = "Impact of Retail Participation Across Shock Intensities",
+         xlab = "Price Shock Category",
+         ylab = "Effect of Retail_Shock on 5-Day CAR",
+         grid = FALSE,
+         col = "steelblue", 
+         pt.join = TRUE,      # Connects the dots to show the trend
+         dict = c("retail_intensity:Shock_Intensity" = "")) # Cleans up labels
+
+coefplot(intensity_feols_vol, 
+         keep = target_order,
+         main = "Impact of Retail Participation Across Shock Intensities",
+         xlab = "Price Shock Category",
+         ylab = "Effect of Retail_Shock on 5-Day CAR",
+         grid = FALSE,
+         col = "steelblue", 
+         pt.join = TRUE,      # Connects the dots to show the trend
+         dict = c("retail_intensity:Shock_Intensity" = "")) # Cleans up labels
+```
+
+
+```{r}
+model_aftermath <- feols(
+  retail_intensity ~ l(Abnormal, -5:5) + log(PRC) + VolatilityRank + l(log(VOL), -5:5) | TICKER + date,
+  data = final_data,
+  panel.id = ~TICKER + date, 
+  cluster = ~date
+)
+
+summary(model_aftermath)
+
+coefplot(model_aftermath, 
+         keep = "Abnormal", 
+         main = "The Retail Response: Days Following an Abnormal Shock")
+
+
+final_data <- final_data %>%
+  mutate(
+    # A positive shock is when Abnormal == 1 AND return is positive
+    Abnormal_Pos = ifelse(Abnormal == 1 & PctChange > 0, 1, 0),
+    # A negative shock is when Abnormal == 1 AND return is negative
+    Abnormal_Neg = ifelse(Abnormal == 1 & PctChange < 0, 1, 0)
+  )
+
+model_asymmetric <- feols(
+  retail_intensity ~ l(Abnormal_Pos, -10:10) + l(Abnormal_Neg, -10:10) + 
+                 log(PRC) + VolatilityRank + l(log(VOL), -10:10) | TICKER + date,
+  data = final_data,
+  panel.id = ~TICKER + date,
+  cluster = ~date
+)
+
+summary(model_asymmetric)
+
+
+# Split Visual Graph
+par(mfrow = c(1, 2))
+
+coefplot(model_asymmetric, keep = "Abnormal_Pos", 
+         main = "Positive Shock Response")
+
+coefplot(model_asymmetric, keep = "Abnormal_Neg", 
+         main = "Negative Shock Response")
+
+par(mfrow = c(1, 1))
+
+```
+
+
+
+
+
+##Abnormal Positive vs. Negative Shock Regressions (Correction)
+```{r}
+p_c_data <- final_data %>%
+  mutate(ReversionRatio_5 = - (Day5_CumReturn / PctChange)) %>%
+  filter(z_abnormal > 2) %>%
+  filter(car * Idiosyncratic_Ret < 0) 
+
+p_m_data <- final_data %>%
+  mutate(ReversionRatio_5 = (Day5_CumReturn / PctChange)) %>%
+  filter(z_abnormal > 2) %>%
+  filter(car * Idiosyncratic_Ret > 0) %>%
+  mutate(ReversionRatio_5 = - (car / Idiosyncratic_Ret)
+  )
+  
+n_c_data <- final_data %>%
+  mutate(ReversionRatio_5 = - (Day5_CumReturn / PctChange)) %>%
+  filter(z_abnormal < -2) %>%
+  filter(car * Idiosyncratic_Ret < 0) %>%
+  mutate(ReversionRatio_5 = - (car / Idiosyncratic_Ret)
+  )
+
+n_m_data <- final_data %>%
+  mutate(ReversionRatio_5 = (Day5_CumReturn / PctChange)) %>%
+  filter(z_abnormal < -2) %>%
+  filter(car * Idiosyncratic_Ret > 0) 
+  
+feols(
+  ReversionRatio_5 ~ retail_intensity + log(VOL) + PctChange + PRC + sd_pct_change  |
+    date,
+  data = p_c_data,
+  cluster = ~ date
+)
+
+feols(
+  ReversionRatio_5 ~ retail_intensity + log(VOL) + PctChange + PRC + sd_pct_change  |
+    date,
+  data = p_m_data,
+  cluster = ~ date
+)
+
+feols(
+  ReversionRatio_5 ~ retail_intensity + log(VOL) + PctChange + PRC + sd_pct_change  |
+    date,
+  data = n_c_data,
+  cluster = ~ date
+)
+
+feols(
+  ReversionRatio_5 ~ retail_intensity + log(VOL) + PctChange + PRC + sd_pct_change  |
+    date,
+  data = n_m_data,
+  cluster = ~ date
+)
+
+
+final_data <- final_data %>%
+  mutate(post_shock_direction = case_when(
+    ,
+    z_abnormal > 2  ~ "High Positive",
+    z_abnormal > 1 ~ "Moderate Positive",
+    z_abnormal < -3 ~ "Extreme Negative",
+    z_abnormal < -2 ~ "High Negative",
+    z_abnormal < -1 ~ "Moderate Negative",
+    TRUE            ~ "Normal"
+  )) %>%
+  
+
+feols(
+  ReversionRatio_5 ~ retail_intensity *  + log(VOL) + PctChange + PRC + sd_pct_change  |
+    date,
+  data = n_m_data,
+  cluster = ~ date
+)
+
+
+
+```
+
+
+
+##Question 2 : Is retail trading more or less common in the days around a shock
+```{r}
+
+model_aftermath <- feols(
+  Retail_Shock ~ l(Abnormal, -5:5) + log(PRC) + VolatilityRank + l(log(VOL), -5:5) | TICKER + date,
+  data = final_data,
+  panel.id = ~TICKER + date, 
+  cluster = ~date
+)
+
+summary(model_aftermath)
+
+coefplot(model_aftermath, 
+         keep = "Abnormal", 
+         main = "The Retail Response: Days Following an Abnormal Shock")
+
+
+final_data <- final_data %>%
+  mutate(
+    # A positive shock is when Abnormal == 1 AND return is positive
+    Abnormal_Pos = ifelse(Abnormal == 1 & PctChange > 0, 1, 0),
+    # A negative shock is when Abnormal == 1 AND return is negative
+    Abnormal_Neg = ifelse(Abnormal == 1 & PctChange < 0, 1, 0)
+  )
+
+model_asymmetric <- feols(
+  Retail_Shock ~ l(Abnormal_Pos, -10:10) + l(Abnormal_Neg, -10:10) + 
+                 log(PRC) + VolatilityRank + l(log(VOL), -10:10) | TICKER + date,
+  data = final_data,
+  panel.id = ~TICKER + date,
+  cluster = ~date
+)
+
+summary(model_asymmetric)
+
+
+# Split Visual Graph
+par(mfrow = c(1, 2))
+
+coefplot(model_asymmetric, keep = "Abnormal_Pos", 
+         main = "Positive Shock Response")
+
+coefplot(model_asymmetric, keep = "Abnormal_Neg", 
+         main = "Negative Shock Response")
+
+par(mfrow = c(1, 1))
+
+```
+
+
